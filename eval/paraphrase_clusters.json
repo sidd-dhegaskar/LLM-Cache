@@ -1,0 +1,47 @@
+[
+  {
+    "cluster_id": "refund",
+    "questions": [
+      "How do I get a refund?",
+      "How can I get my money refunded?",
+      "What's the process for getting a refund?",
+      "How do I request a refund for my order?"
+    ]
+  },
+  {
+    "cluster_id": "support_contact",
+    "questions": [
+      "How do I contact customer support?",
+      "How can I get in touch with support?",
+      "What's the best way to contact customer service?",
+      "How do I reach out to your support team?"
+    ]
+  },
+  {
+    "cluster_id": "password_reset",
+    "questions": [
+      "How do I reset my password?",
+      "How can I change my account password?",
+      "What's the process to reset a forgotten password?",
+      "How do I create a new password for my account?"
+    ]
+  },
+  {
+    "cluster_id": "shipping_time",
+    "questions": [
+      "How long does shipping take?",
+      "How many days does delivery take?",
+      "What is the typical delivery time?",
+      "How long until my order arrives?"
+    ]
+  },
+  {
+    "cluster_id": "subscription_change",
+    "questions": [
+      "How do I change my subscription plan?",
+      "How can I switch to a different subscription plan?",
+      "What's the process to update my subscription plan?",
+      "How do I upgrade or downgrade my plan?"
+    ]
+  }
+]
