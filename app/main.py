@@ -1,21 +1,38 @@
 """
-Phase 3 — Semantic Cache.
+Phase 4 — Redis as the Shared Cache.
 POST /ask -> exact-match cache -> semantic cache -> LLM only on miss.
+Same flow as Phase 3; the caches are now backed by Redis instead of
+in-process Python objects, so multiple app instances share cache state.
 """
+import logging
 import os
 import time
 
-from fastapi import FastAPI
-from pydantic import BaseModel
+from dotenv import load_dotenv
 
-from app.cache.exact_cache import ExactMatchCache
-from app.cache.semantic_cache import SemanticCache
+# must run before any app.* import that reads os.getenv() at module load time
+# (app.gemini_client reads GEMINI_API_KEY as soon as it's imported)
+load_dotenv()
+
+# INFO-level logging is silent by default in Python — this makes the
+# logger.info(...) calls in llm_client.py / gemini_client.py actually print.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+logger = logging.getLogger("app.main")
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from redis import Redis
+import httpx
+
+from app.cache.redis_exact_cache import RedisExactMatchCache
+from app.cache.redis_semantic_cache import RedisSemanticCache
 from app.embeddings import embed
 from app.llm_client import ask_llm
 
-app = FastAPI(title="LLM Cache — Phase 3: Semantic Cache")
+app = FastAPI(title="LLM Cache — Phase 4: Redis Shared Cache")
 
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.65"))
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
 class Stats:
@@ -77,8 +94,10 @@ class Stats:
 
 
 stats = Stats()
-exact_cache = ExactMatchCache()
-semantic_cache = SemanticCache(threshold=SIMILARITY_THRESHOLD)
+# one shared Redis connection, handed to both caches — see NOTES.md "Phase 4"
+redis_client = Redis.from_url(REDIS_URL)
+exact_cache = RedisExactMatchCache(redis_client)
+semantic_cache = RedisSemanticCache(redis_client, threshold=SIMILARITY_THRESHOLD)
 
 
 class AskRequest(BaseModel):
@@ -92,17 +111,21 @@ class AskResponse(BaseModel):
     matched_question: str | None = None
     latency_s: float
     cost_usd: float
+    prompt_tokens: int = 0
+    output_tokens: int = 0
 
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
     start = time.perf_counter()
+    logger.info("ask request: question=%r", req.question)
 
     # 1. exact-match fast path — no embedding needed
     exact_answer = exact_cache.get(req.question)
     if exact_answer is not None:
         latency_s = time.perf_counter() - start
         stats.record(request_latency_s=latency_s, outcome="exact_hit")
+        logger.info("ask response: outcome=exact_hit latency=%.3fs", latency_s)
         return AskResponse(answer=exact_answer, outcome="exact_hit", latency_s=round(latency_s, 3), cost_usd=0.0)
 
     # 2. semantic path — embed once, reuse for lookup and (on miss) storage
@@ -118,6 +141,10 @@ async def ask(req: AskRequest):
             outcome="semantic_hit",
             embedding_latency_s=embedding_result.latency_s,
         )
+        logger.info(
+            "ask response: outcome=semantic_hit similarity=%.4f latency=%.3fs",
+            semantic_result.similarity, latency_s,
+        )
         return AskResponse(
             answer=semantic_result.answer,
             outcome="semantic_hit",
@@ -128,7 +155,14 @@ async def ask(req: AskRequest):
         )
 
     # 3. miss — call the LLM, store in both caches
-    llm_result = await ask_llm(req.question)
+    try:
+        llm_result = await ask_llm(req.question)
+    except httpx.HTTPError as e:
+        # LLM provider timed out / errored / was unreachable — surface a
+        # clean 502 instead of letting the raw exception crash the request.
+        logger.exception("ask failed: LLM request error")
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {e}") from e
+
     exact_cache.set(req.question, llm_result.answer)
     semantic_cache.add(req.question, llm_result.answer, query_vector)
 
@@ -140,12 +174,18 @@ async def ask(req: AskRequest):
         llm_latency_s=llm_result.latency_s,
         cost=llm_result.cost,
     )
+    logger.info(
+        "ask response: outcome=miss latency=%.3fs cost=$%.6f prompt_tokens=%d output_tokens=%d",
+        latency_s, llm_result.cost, llm_result.prompt_tokens, llm_result.output_tokens,
+    )
     return AskResponse(
         answer=llm_result.answer,
         outcome="miss",
         similarity=round(semantic_result.similarity, 4) if semantic_result.similarity is not None else None,
         latency_s=round(latency_s, 3),
         cost_usd=llm_result.cost,
+        prompt_tokens=llm_result.prompt_tokens,
+        output_tokens=llm_result.output_tokens,
     )
 
 

@@ -205,3 +205,162 @@ call, layered the same way) doesn't need to change conceptually — only what's 
 The embeddings themselves, the threshold (0.65), and the layering order (exact-match first, then
 semantic) all carry over unchanged from Phase 3 — Phase 4 only relocates *where* the cache state
 lives, not how caching decisions are made.
+
+## Phase 4 — Redis as the Shared Cache
+
+### The problem being fixed
+
+`ExactMatchCache` and `SemanticCache` are Python objects living inside one `uvicorn` process's
+memory. Run a second instance of the app and it gets its own separate memory — there is no shared
+RAM between two OS processes by default. So instance B's cache starts empty and stays independent
+of instance A's, no matter how many questions A has already answered and cached. Redis fixes this
+by moving the cache out of any single app process into its own separate process that every app
+instance connects to over the network — the data lives in Redis's memory, not any app's memory.
+
+### Exact-match cache → Redis strings
+
+`app/cache/redis_exact_cache.py` replaces the Python `dict` with plain Redis `GET`/`SET`:
+
+```python
+class RedisExactMatchCache:
+    def __init__(self, redis_client: Redis):
+        self._redis = redis_client
+
+    def _key(self, question: str) -> str:
+        return f"{KEY_PREFIX}{normalize(question)}"
+
+    def get(self, question: str) -> str | None:
+        value = self._redis.get(self._key(question))
+        return value.decode("utf-8") if value is not None else None
+
+    def set(self, question: str, answer: str) -> None:
+        self._redis.set(self._key(question), answer)
+```
+
+- Takes an already-connected `Redis` client rather than opening its own connection, so `main.py`
+  can create one connection and share it across both caches.
+- `_key()` builds the actual Redis key string, e.g. `"How do I get a refund?"` →
+  `cache:exact:how do i get a refund?`, reusing the same `normalize()` used in Phase 2.
+- `redis-py` returns raw **bytes**, not `str` — Redis itself has no concept of text encoding, it
+  just stores byte strings. `get()` has to `.decode("utf-8")` to hand back a normal Python string;
+  encoding on the way in (`set()`) is handled automatically by the client.
+- Same public interface (`get`/`set`) as the original in-memory `ExactMatchCache`, so `main.py`'s
+  calling code doesn't change — only which class gets instantiated, and where the bytes end up.
+
+### Semantic cache → Redis + RediSearch vector index
+
+Plain Redis commands (`GET`, `SET`, `HSET`) only work when you already know the exact key you
+want. Semantic lookup is the opposite problem — given a new embedding, we don't know which stored
+key is closest; we have to compare against everything and rank by similarity. That capability
+comes from **RediSearch**, an add-on module (bundled in the `redis/redis-stack` Docker image) that
+adds a `VECTOR` field type and similarity search on top of base Redis.
+
+**The filing-cabinet way to think about indexing**: Redis by itself is a cabinet of labeled
+folders — it hands you a folder by its label and doesn't know what's inside. An index is a
+standing instruction given once: "watch every folder matching this pattern, and keep a separate,
+self-updating lookup structure organized around one particular field inside it, so I can ask
+'find me the closest match' quickly later." You say this once (`FT.CREATE`); after that, every
+new folder written that matches the pattern is automatically slotted into that structure as a side
+effect of the write — no second "index this" call needed per entry.
+
+**Creating the index** (`app/cache/redis_semantic_cache.py`):
+
+```python
+self._redis.ft(INDEX_NAME).create_index(
+    fields=[
+        TextField("question"),
+        TextField("answer"),
+        NumericField("created_at"),
+        VectorField(
+            "embedding",
+            "FLAT",
+            {
+                "TYPE": "FLOAT32",
+                "DIM": EMBEDDING_DIM,
+                "DISTANCE_METRIC": "COSINE",
+            },
+        ),
+    ],
+    definition=IndexDefinition(prefix=[KEY_PREFIX], index_type=IndexType.HASH),
+)
+```
+
+- `.ft(INDEX_NAME)` switches into RediSearch's command namespace for an index named
+  `idx:semantic_cache`; `.create_index(...)` wraps the raw `FT.CREATE` command.
+- `fields=[...]` — only fields listed here are indexed/searchable; other hash fields are ignored
+  for search purposes. `question`/`answer` are declared `TextField` (enables full-text search,
+  and ensures they come back cleanly in results); `created_at` is `NumericField` (unused for now,
+  placeholder value — would support range/sort queries later).
+- `VectorField("embedding", "FLAT", {...})` is the core of it — declares the `embedding` field as
+  a vector and tells Redis to build a similarity-search structure around it:
+  - `"FLAT"` — brute-force exact search (compares the query against every stored vector), matching
+    the exact-search behavior of the Phase 3 numpy version. The alternative, `"HNSW"`, is an
+    approximate graph-based method built for large-scale search — not needed at this project's
+    cache size.
+  - `"TYPE": "FLOAT32"`, `"DIM": EMBEDDING_DIM` — each vector is 384 32-bit floats
+    (`all-MiniLM-L6-v2`'s fixed output size), matching how `_vector_to_bytes` packs the numpy array.
+  - `"DISTANCE_METRIC": "COSINE"` — matches the cosine similarity the Phase 3 eval and 0.65
+    threshold were calibrated against.
+- `IndexDefinition(prefix=[KEY_PREFIX], index_type=IndexType.HASH)` — scopes the index to only
+  keys starting with `cache:vec:` (ignoring the exact-match cache's `cache:exact:` keys entirely),
+  and declares the data is stored as Redis hashes (`HSET`), matching how `add()` writes entries.
+
+Because `FT.CREATE` errors if the index already exists (e.g. on app restart), the call is wrapped
+in a try/except that swallows that specific error only.
+
+**Converting a numpy vector to what Redis expects**:
+
+```python
+def _vector_to_bytes(vector: np.ndarray) -> bytes:
+    return vector.astype(np.float32).tobytes()
+```
+
+Redis stores/compares vectors as raw float32 bytes, not JSON or text. This packs the numpy array
+into that exact binary layout — used both when writing a new cache entry and when sending the
+query vector for a lookup, so both sides use the same byte format.
+
+**Lookup, replacing the Phase 3 `matrix @ vector` line**: instead of computing similarity
+ourselves in Python, a single `FT.SEARCH` query asks Redis to find the nearest neighbor using the
+index built above — the comparison happens inside Redis, not in our process. One detail that
+required care: RediSearch reports cosine as a *distance* (0 = identical, larger = more different),
+the inverse of the *similarity* score (1 = identical) the Phase 3 threshold logic expects, so the
+lookup code flips it back (`similarity = 1 - distance`) to keep reusing the same 0.65 cutoff.
+
+**Adding an entry**: one `HSET` per cache entry, under a key matching `cache:vec:`. Because the
+key matches the index's prefix, RediSearch picks it up into the index automatically — writing the
+hash and indexing it are the same operation from the caller's point of view.
+
+### What changes vs. what stays the same
+
+`main.py`'s `/ask` flow — exact-match check, then semantic check, then LLM call — is unchanged in
+shape. Only what's underneath each `.get()`/`.lookup()`/`.set()`/`.add()` call moved: from Python
+objects in one process's RAM to a Redis container every app instance connects to. The embeddings,
+the 0.65 threshold, and the exact-then-semantic layering order all carry over unchanged from
+Phase 3.
+
+### Running Redis for this project
+
+`docker-compose.yml` runs the `redis/redis-stack` image (Redis + RediSearch bundled, avoiding a
+manual module install), exposing port 6379 for the Redis protocol and port 8001 for RedisInsight
+(a web UI for browsing keys and the vector index directly, at `http://localhost:8001`). Started
+with `docker compose up -d`.
+
+### `redis-py` import path gotcha
+
+`IndexDefinition`/`IndexType` live at `redis.commands.search.indexDefinition` (camelCase module
+name), not the more Pythonic `index_definition` — a reasonable guess that doesn't match the
+actual package layout. Worth checking `import redis.commands.search` and listing its directory
+rather than guessing snake_case for third-party module paths.
+
+### Verified: cache is shared across instances
+
+Started two separate `uvicorn` processes (`app.main:app` on ports 8000 and 8001), both pointed at
+the same `REDIS_URL`. Asked instance A (8000) a question — cache miss, LLM called, answer stored.
+Asked instance B (8001) the *same* question — came back as an `exact_hit`, despite instance B
+never having called the LLM itself and having no in-process memory shared with instance A.
+
+This is the concrete proof of the Phase 4 milestone: two OS processes with completely separate
+Python memory now share cache state, because that state lives in Redis rather than in either
+process. This is the same failure mode Phase 2/3's in-memory caches had (each process's cache was
+invisible to every other process) — Phase 4 fixes it by relocating the cache to a shared service
+instead of changing the caching logic itself.

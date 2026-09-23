@@ -701,5 +701,499 @@ So your complete architecture is:
                                     ▼
                              store new vector
 ```
+
+## 12. Redis basics — Hashes, HSET, HGET
+
+### What is Redis?
+
+Redis stores data in memory using different data structures.
+
+For example:
+
+```
+key              value
+-------------------------
+name             "Alice"
+age              25
+```
+
+You can think of Redis as a giant in-memory dictionary:
+
+```
+KEY → DATA
+```
+
+For simple values, you can use:
+
+```
+SET name "Alice"
+GET name
+```
+
+Result:
+
+```
+Alice
+```
+
+But Redis can store more than just one value per key.
+
+### What is a Hash?
+
+A Redis Hash is basically a small collection of field → value pairs stored under one Redis key.
+
+Think of it like a JSON object:
+
+```
+{
+  "name": "Alice",
+  "age": "25",
+  "city": "Bangalore"
+}
+```
+
+In Redis, you could represent this as:
+
+```
+Key: user:123
+
+Fields:
+    name → Alice
+    age  → 25
+    city → Bangalore
+```
+
+So:
+
+```
+user:123
+   │
+   ├── name → Alice
+   ├── age  → 25
+   └── city → Bangalore
+```
+
+This entire thing is called a Redis Hash.
+
+### What does HSET mean?
+
+HSET means:
+
+> Set a field inside a Hash.
+
+For example:
+
+```
+HSET user:123 name "Alice"
+```
+
+You're saying:
+
+> Inside the Redis key `user:123`, create/update the field `name` with value `"Alice"`.
+
+Now Redis has:
+
+```
+user:123
+   │
+   └── name → Alice
+```
+
+You can add more fields:
+
+```
+HSET user:123 age 25
+HSET user:123 city "Bangalore"
+```
+
+Now:
+
+```
+user:123
+   ├── name → Alice
+   ├── age  → 25
+   └── city → Bangalore
+```
+
+You can also set multiple fields at once:
+
+```
+HSET user:123 name "Alice" age 25 city "Bangalore"
+```
+
+### What does HGET mean?
+
+HGET means:
+
+> Get one field from a Hash.
+
+For example:
+
+```
+HGET user:123 name
+```
+
+Redis returns:
+
+```
+Alice
+```
+
+Or:
+
+```
+HGET user:123 age
+```
+
+returns:
+
+```
+25
+```
+
+So the basic relationship is:
+
+```
+HSET = write a field
+HGET = read a field
+```
+
+### SET/GET vs HSET/HGET
+
+This distinction is important.
+
+**Normal Redis key**
+
+```
+SET name "Alice"
+```
+
+You have:
+
+```
+name → Alice
+```
+
+There is one value associated with `name`.
+
+**Redis Hash**
+
+```
+HSET user:123 name "Alice"
+HSET user:123 age 25
+```
+
+You have:
+
+```
+user:123
+   ├── name → Alice
+   └── age  → 25
+```
+
+So:
+
+```
+SET/GET
+    key → value
+
+HSET/HGET
+    key → {
+        field → value
+        field → value
+        field → value
+    }
+```
+
+That's the fundamental idea.
+
+### Connecting this to the vector-cache example
+
+```
+HSET cache:vec:1 question "How do I get a refund?" answer "..." embedding <bytes> created_at "..."
+```
+
+This is creating a Redis Hash:
+
+```
+cache:vec:1
+   │
+   ├── question   → "How do I get a refund?"
+   ├── answer     → "..."
+   ├── embedding  → <vector bytes>
+   └── created_at → "..."
+```
+
+Redis isn't treating this as some special "AI object." It's simply a Hash containing fields.
+
+You could retrieve individual fields:
+
+```
+HGET cache:vec:1 question
+```
+
+→
+
+```
+How do I get a refund?
+```
+
+Or:
+
+```
+HGET cache:vec:1 answer
+```
+
+→
+
+```
+...
+```
+
+Or retrieve everything:
+
+```
+HGETALL cache:vec:1
+```
+
+which gives you all the fields and values.
+
+### Why use a Hash for this?
+
+Because one cache entry naturally contains multiple pieces of information:
+
+```
+cache entry #1
+
+question
+answer
+embedding
+created_at
+```
+
+Instead of creating four unrelated Redis keys:
+
+```
+cache:vec:1:question
+cache:vec:1:answer
+cache:vec:1:embedding
+cache:vec:1:created_at
+```
+
+you group them together:
+
+```
+cache:vec:1
+   ├── question
+   ├── answer
+   ├── embedding
+   └── created_at
+```
+
+This is what Redis Hashes are useful for.
+
+### Data vs. Index — two separate things
+
+There are two separate things:
+
+**Your actual data** — you explicitly create it:
+
+```
+HSET cache:vec:1 ...
+```
+
+Result:
+
+```
+cache:vec:1
+   ├── question
+   ├── answer
+   ├── embedding
+   └── created_at
+```
+
+**Redis Search index** — you create it with:
+
+```
+FT.CREATE ...
+```
+
+This is not another Hash. It's an additional data structure Redis maintains to efficiently search the data in those Hashes.
+
+So eventually you'll have something conceptually like:
+
+```
+                 Redis
+
+        ┌─────────────────────┐
+        │ Your actual data    │
+        │                     │
+        │ cache:vec:1         │
+        │   ├─ question       │
+        │   ├─ answer         │
+        │   └─ embedding      │
+        │                     │
+        │ cache:vec:2         │
+        │   ├─ question       │
+        │   ├─ answer         │
+        │   └─ embedding      │
+        └─────────────────────┘
+                  │
+                  │ indexed by
+                  ▼
+        ┌─────────────────────┐
+        │ Redis Search Index  │
+        │                     │
+        │ vector → structure  │
+        │ for fast searching  │
+        └─────────────────────┘
+```
+
+The Hash is your data. HSET/HGET are how you write/read that data. The index is a separate structure used to search it efficiently.
+
+### How the Hash is useful for search
+
+The key idea is:
+
+> The Hash stores the information. The index uses information from the Hash to make searching fast.
+
+**1. Your data is stored in Hashes**
+
+```
+HSET cache:vec:1 question "How do I get a refund?" answer "You can request a refund..." embedding <vector>
+HSET cache:vec:2 question "How can I return my order?" answer "Go to returns..." embedding <vector>
+HSET cache:vec:3 question "How do I change my password?" answer "Go to settings..." embedding <vector>
+```
+
+Conceptually:
+
+```
+cache:vec:1
+ ├── question  → "How do I get a refund?"
+ ├── answer    → "You can request a refund..."
+ └── embedding → [0.12, 0.83, ...]
+
+cache:vec:2
+ ├── question  → "How can I return my order?"
+ ├── answer    → "Go to returns..."
+ └── embedding → [0.15, 0.79, ...]
+
+cache:vec:3
+ ├── question  → "How do I change my password?"
+ ├── answer    → "Go to settings..."
+ └── embedding → [0.91, 0.12, ...]
+```
+
+The Hash itself doesn't make semantic search fast.
+
+**2. The index looks at the embedding field**
+
+When you create an index telling Redis that `embedding` is a vector field, Redis Search starts maintaining an index based on those vectors.
+
+For example, with HNSW:
+
+```
+Hash data                     HNSW index
+
+cache:vec:1 ────────────────→ vector 1
+                                  ↕
+cache:vec:2 ────────────────→ vector 2
+                                  ↕
+cache:vec:3 ────────────────→ vector 3
+```
+
+The important part is that the index associates:
+
+```
+vector → Redis key
+```
+
+So Redis can eventually say:
+
+> "The vectors closest to this query vector correspond to cache:vec:1 and cache:vec:2."
+
+**3. A user asks a new question**
+
+Suppose the user asks:
+
+```
+"Can I get my money back?"
+```
+
+Your application converts that into an embedding:
+
+```
+"Can I get my money back?"
+             ↓
+[0.13, 0.81, 0.42, ...]
+```
+
+Now Redis Search searches the vector index for vectors close to this one. It might find:
+
+```
+Query vector
+     │
+     ├── closest → cache:vec:1
+     │              "How do I get a refund?"
+     │
+     ├── next     → cache:vec:2
+     │              "How can I return my order?"
+     │
+     └── far      → cache:vec:3
+                    "How do I change my password?"
+```
+
+Then Redis gives you the matching keys.
+
+**4. Then you use HGET to get the actual answer**
+
+Suppose the search returns `cache:vec:1`. Now your application can do:
+
+```
+HGET cache:vec:1 answer
+```
+
+and get:
+
+```
+"You can request a refund..."
+```
+
+So the whole flow is:
+
+```
+User question
+     │
+     ▼
+Create embedding
+     │
+     ▼
+Search vector index
+     │
+     ▼
+Find cache:vec:1
+     │
+     ▼
+HGET cache:vec:1 answer
+     │
+     ▼
+Return cached answer
+```
+
+**The important separation:**
+
+```
+HASH
+└── Stores the actual data
+    ├── question
+    ├── answer
+    └── embedding
+
+INDEX
+└── Makes finding relevant Hashes fast
+    └── uses the embedding
+```
+
+So HGET isn't what performs the semantic search. HGET is basically the final step: "I found the relevant Redis key; now give me the answer stored inside it."
 </content>
 </invoke>
